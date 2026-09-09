@@ -48,7 +48,7 @@ export default function App() {
                 title={
                   llmOk
                     ? `LLM ready: ${health.llm.model}`
-                    : "Local LLM not detected — start Ollama and pull the model"
+                    : "LLM offline — the OpenRouter model is unavailable right now"
                 }
               >
                 <span className="h-1.5 w-1.5 rounded-full bg-current" />

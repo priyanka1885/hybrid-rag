@@ -106,14 +106,8 @@ export default function Ask() {
 
       {result && result.llm_available === false && (
         <div className="mt-8 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800">
-          <p className="font-semibold">Local LLM unavailable</p>
+          <p className="font-semibold">Answer generation unavailable</p>
           <p className="mt-1">{result.answer}</p>
-          <p className="mt-2 text-amber-700">
-            Start Ollama and pull the model, then ask again:
-          </p>
-          <pre className="mt-1 rounded-lg bg-amber-100 px-3 py-2 text-xs text-amber-900">
-            ollama pull llama3.1:8b
-          </pre>
           <p className="mt-3 text-xs text-amber-700">
             Retrieval still works — expand “View Retrieval Details” below to inspect the
             evidence the pipeline found.

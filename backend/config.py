@@ -80,12 +80,19 @@ EVAL_RESULTS_PATH = PROCESSED_DIR / "evaluation.json"
 class Settings:
     """Runtime configuration, sourced from environment variables."""
 
-    # --- Local LLM (Ollama) ---
-    LLM_MODEL: str = _get("LLM_MODEL", "llama3.1:8b")
-    LLM_BASE_URL: str = _get("LLM_BASE_URL", "http://localhost:11434")
-    # Generous default: on CPU the first call must load the model into memory
-    # (cold start) which can take a few minutes for an 8B model.
-    LLM_TIMEOUT: int = _get_int("LLM_TIMEOUT", 300)
+    # --- LLM (OpenRouter, OpenAI-compatible chat completions) ---
+    # The LLM is served by OpenRouter's hosted API using the free Llama 3.1 8B
+    # Instruct model. Model name and base URL stay configurable via .env so the
+    # model can be swapped without code changes; nothing is hardcoded elsewhere.
+    LLM_MODEL: str = _get("LLM_MODEL", "inclusionai/ling-3.0-flash-fin:free")
+    LLM_BASE_URL: str = _get("LLM_BASE_URL", "https://openrouter.ai/api")
+    # API key for OpenRouter. Read ONLY from the environment - never hardcoded
+    # and never committed. Empty string means "not configured", which health/
+    # generation surface as a friendly message instead of crashing.
+    OPENROUTER_API_KEY: str = _get("OPENROUTER_API_KEY", "")
+    # Request timeout (seconds) for a single chat-completion call. Hosted models
+    # respond quickly, but free-tier requests can queue, so keep it generous.
+    LLM_TIMEOUT: int = _get_int("LLM_TIMEOUT", 120)
     LLM_TEMPERATURE: float = _get_float("LLM_TEMPERATURE", 0.0)
 
     # --- Embeddings ---

@@ -1,14 +1,22 @@
 """
-Local LLM client (Ollama) for grounded answer generation.
+LLM client (OpenRouter) for grounded answer generation.
 
     Question + Retrieved Evidence -> Llama 3.1 8B Instruct -> Grounded Answer
 
-The model is instructed to answer ONLY from the supplied evidence and to cite
-sources with [n] markers. The model name and base URL are configurable via
-.env (LLM_MODEL, LLM_BASE_URL) - never hardcoded elsewhere.
+Generation is served by OpenRouter's hosted, OpenAI-compatible chat-completions
+API using the free Llama 3.1 8B Instruct model. The model is instructed to
+answer ONLY from the supplied evidence and to cite sources with [n] markers.
 
-If Ollama is not running or the model is missing, we raise LLMUnavailableError
-so callers can show a friendly message instead of crashing.
+The model name, base URL, and API key are configurable via .env
+(LLM_MODEL, LLM_BASE_URL, OPENROUTER_API_KEY) - never hardcoded elsewhere and
+the key is never committed.
+
+The public class name (OllamaClient) and its interface (health/warmup/generate)
+are kept unchanged so the rest of the pipeline does not need to be touched.
+
+If the API key is missing, OpenRouter is unreachable, or the request times out,
+we raise LLMUnavailableError so callers can show a friendly message instead of
+crashing.
 """
 from __future__ import annotations
 
@@ -21,7 +29,7 @@ from backend.config import settings
 
 
 class LLMUnavailableError(RuntimeError):
-    """Raised when the local LLM cannot be reached or the model is missing."""
+    """Raised when the LLM API cannot be reached, is misconfigured, or errors."""
 
 
 SYSTEM_PROMPT = """You are a careful financial-report analyst. You answer questions ONLY using the \
@@ -198,28 +206,80 @@ def build_user_prompt(question: str, evidence: list[dict], focus: bool = False) 
 
 
 class OllamaClient:
-    def __init__(self, model: str | None = None, base_url: str | None = None):
+    """Client for the OpenRouter chat-completions API.
+
+    The historical name is retained so nothing downstream needs to change; it
+    now talks to OpenRouter's OpenAI-compatible endpoint rather than a local
+    Ollama server. The model, base URL and API key all come from settings
+    (.env) and can be overridden per-instance for local development/tests.
+    """
+
+    def __init__(
+        self,
+        model: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+    ):
         self.model = model or settings.LLM_MODEL
         self.base_url = (base_url or settings.LLM_BASE_URL).rstrip("/")
+        # Never hardcoded: falls back to the env-sourced setting only.
+        self.api_key = api_key if api_key is not None else settings.OPENROUTER_API_KEY
         self.timeout = settings.LLM_TIMEOUT
 
+    # -- HTTP helpers --------------------------------------------------------
+    @property
+    def _chat_url(self) -> str:
+        """OpenAI-compatible chat-completions endpoint on OpenRouter."""
+        return f"{self.base_url}/v1/chat/completions"
+
+    @property
+    def _models_url(self) -> str:
+        return f"{self.base_url}/v1/models"
+
+    def _headers(self) -> dict:
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
+
     def health(self) -> dict:
-        """Return a dict describing local LLM availability."""
+        """Return a dict describing LLM (OpenRouter) availability.
+
+        Does NOT depend on any local Ollama endpoint. Availability is gated on
+        the API key being configured; when a key is present we additionally do a
+        light-weight, short-timeout call to the models endpoint to confirm the
+        API is reachable and that the configured model is offered. The returned
+        shape (reachable / model_available / model / available_models) is kept
+        identical to the previous implementation so callers are unaffected.
+        """
+        if not self.api_key:
+            return {
+                "reachable": False,
+                "model_available": False,
+                "model": self.model,
+                "available_models": [],
+                "note": "OPENROUTER_API_KEY is not set.",
+            }
         try:
-            resp = requests.get(f"{self.base_url}/api/tags", timeout=5)
+            resp = requests.get(self._models_url, headers=self._headers(), timeout=5)
             resp.raise_for_status()
-            tags = resp.json().get("models", [])
-            names = {m.get("name", "") for m in tags}
-            model_present = any(
-                n == self.model or n.split(":")[0] == self.model.split(":")[0] for n in names
+            data = resp.json().get("data", [])
+            names = {m.get("id", "") for m in data if isinstance(m, dict)}
+            # Match on the exact id, or ignoring an optional ":free"/":<variant>"
+            # suffix, so a configured "...:free" model still resolves.
+            model_present = (not names) or any(
+                n == self.model or n.split(":")[0] == self.model.split(":")[0]
+                for n in names
             )
             return {
                 "reachable": True,
                 "model_available": model_present,
                 "model": self.model,
-                "available_models": sorted(names),
+                "available_models": sorted(n for n in names if n),
             }
         except Exception:
+            # Key is present but the API could not be reached right now. Report
+            # unreachable rather than raising, so /health never crashes.
             return {
                 "reachable": False,
                 "model_available": False,
@@ -228,54 +288,80 @@ class OllamaClient:
             }
 
     def warmup(self) -> bool:
-        """Preload the model into memory so the first real request is fast.
+        """No-op warmup for the hosted API.
 
-        Sends an empty-prompt generate request, which makes Ollama load the
-        model without producing tokens. Best-effort: returns True on success,
-        False otherwise (never raises).
+        OpenRouter is a hosted service, so there is no local model to preload
+        into memory and no cold start to hide. Kept for interface compatibility;
+        best-effort and never raises. Returns True when a key is configured.
         """
-        try:
-            resp = requests.post(
-                f"{self.base_url}/api/generate",
-                json={"model": self.model, "prompt": "", "stream": False, "keep_alive": "30m"},
-                timeout=self.timeout,
-            )
-            return resp.ok
-        except requests.exceptions.RequestException:
-            return False
+        return bool(self.api_key)
 
     def generate(self, question: str, evidence: list[dict], focus: bool = False) -> LLMResponse:
+        if not self.api_key:
+            raise LLMUnavailableError(
+                "LLM is not configured. Set OPENROUTER_API_KEY in your environment "
+                "to enable answer generation."
+            )
+
         prompt = build_user_prompt(question, evidence, focus=focus)
         payload = {
             "model": self.model,
-            "prompt": prompt,
-            "system": SYSTEM_PROMPT,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": settings.LLM_TEMPERATURE,
             "stream": False,
-            "keep_alive": "30m",  # keep the model warm between requests
-            "options": {"temperature": settings.LLM_TEMPERATURE},
         }
         try:
             resp = requests.post(
-                f"{self.base_url}/api/generate", json=payload, timeout=self.timeout
+                self._chat_url,
+                json=payload,
+                headers=self._headers(),
+                timeout=self.timeout,
             )
+        except requests.exceptions.Timeout as exc:
+            raise LLMUnavailableError(
+                f"The LLM request timed out after {self.timeout}s. Please try again."
+            ) from exc
         except requests.exceptions.RequestException as exc:
             raise LLMUnavailableError(
-                "Local LLM is unavailable. Please make sure Ollama is running and "
-                f"{self.model} is available."
+                "The LLM API (OpenRouter) is unreachable. Please check your network "
+                "connection and OPENROUTER_API_KEY."
             ) from exc
 
+        if resp.status_code in (401, 403):
+            raise LLMUnavailableError(
+                "OpenRouter rejected the request (authentication failed). Check that "
+                "OPENROUTER_API_KEY is valid."
+            )
         if resp.status_code == 404:
             raise LLMUnavailableError(
-                f"Model '{self.model}' not found in Ollama. Run: ollama pull {self.model}"
+                f"Model '{self.model}' is not available on OpenRouter. "
+                "Check the LLM_MODEL setting."
+            )
+        if resp.status_code == 429:
+            raise LLMUnavailableError(
+                "Free OpenRouter model is temporarily rate-limited. Please try again later."
             )
         if not resp.ok:
             raise LLMUnavailableError(
-                f"Local LLM returned an error ({resp.status_code}). "
-                "Check that Ollama is running correctly."
+                f"The LLM API returned an error ({resp.status_code}). Please try again."
             )
         try:
             data = resp.json()
         except json.JSONDecodeError as exc:
-            raise LLMUnavailableError("Local LLM returned an invalid response.") from exc
+            raise LLMUnavailableError("The LLM API returned an invalid response.") from exc
 
-        return LLMResponse(text=(data.get("response") or "").strip(), model=self.model)
+        # OpenRouter can return a top-level error object even with a 200 status.
+        if isinstance(data, dict) and data.get("error"):
+            msg = data["error"].get("message") if isinstance(data["error"], dict) else str(data["error"])
+            raise LLMUnavailableError(f"The LLM API returned an error: {msg}")
+
+        text = ""
+        choices = data.get("choices") if isinstance(data, dict) else None
+        if choices:
+            message = choices[0].get("message") or {}
+            text = message.get("content") or ""
+
+        return LLMResponse(text=text.strip(), model=self.model)

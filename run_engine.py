@@ -10,9 +10,9 @@ Exercises the whole chain for a set of representative queries:
 
 Prints, per query: resolved filter, answerability status, the grounded answer,
 its citations, the verification verdict, and the final (post-boost) evidence
-order the LLM actually received. Requires Ollama running with the configured
-LLM model; if it is unavailable the retrieval/rerank stages still run and the
-answer field reports the unavailability.
+order the LLM actually received. Requires OPENROUTER_API_KEY to be set for the
+configured LLM model; if it is unavailable the retrieval/rerank stages still
+run and the answer field reports the unavailability.
 
 Run:  python run_engine.py
 """

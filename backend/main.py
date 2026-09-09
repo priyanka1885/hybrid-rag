@@ -43,16 +43,18 @@ _load_error: str | None = None
 
 
 def _warmup_llm() -> None:
-    """Best-effort background warmup so the first question isn't a cold start."""
+    """Best-effort startup check that the hosted LLM (OpenRouter) is reachable."""
     try:
         client = OllamaClient()
         status = client.health()
         if status.get("reachable") and status.get("model_available"):
-            print(f"[startup] Warming up LLM '{client.model}' in background…", file=sys.stderr)
-            if client.warmup():
-                print("[startup] LLM warm and ready.", file=sys.stderr)
-    except Exception as exc:  # never let warmup break startup
-        print(f"[startup] LLM warmup skipped: {exc}", file=sys.stderr)
+            print(f"[startup] LLM '{client.model}' is reachable via OpenRouter.", file=sys.stderr)
+            client.warmup()
+        else:
+            print("[startup] LLM not configured/reachable yet (set OPENROUTER_API_KEY).",
+                  file=sys.stderr)
+    except Exception as exc:  # never let this break startup
+        print(f"[startup] LLM check skipped: {exc}", file=sys.stderr)
 
 
 @asynccontextmanager
