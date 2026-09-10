@@ -1,0 +1,40 @@
+{
+  "num_eval_questions": 200,
+  "k": 4,
+  "methods": {
+    "dense": {
+      "label": "Dense",
+      "recall_at_k": 0.36,
+      "precision_at_k": 0.1212,
+      "mrr": 0.2313,
+      "hit_rate": 0.36
+    },
+    "bm25": {
+      "label": "BM25",
+      "recall_at_k": 0.295,
+      "precision_at_k": 0.1212,
+      "mrr": 0.2121,
+      "hit_rate": 0.295
+    },
+    "hybrid": {
+      "label": "Hybrid",
+      "recall_at_k": 0.345,
+      "precision_at_k": 0.1338,
+      "mrr": 0.2544,
+      "hit_rate": 0.345
+    },
+    "hybrid_reranked": {
+      "label": "Hybrid + Cross-Encoder",
+      "recall_at_k": 0.35,
+      "precision_at_k": 0.1363,
+      "mrr": 0.2655,
+      "hit_rate": 0.35
+    }
+  },
+  "metric_names": [
+    "Recall@K",
+    "Precision@K",
+    "MRR",
+    "Hit Rate"
+  ]
+}

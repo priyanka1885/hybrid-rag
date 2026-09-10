@@ -11,9 +11,25 @@ env/
 # --- Environment ---
 .env
 
-# --- Generated data / indexes (rebuilt via scripts/ingest.py) ---
-data/processed/
-data/indexes/
+# --- Generated data / indexes ---
+# The search indexes ARE committed. The deployed service reads them directly and
+# the Render build only installs serving dependencies - it no longer runs
+# scripts/ingest.py, which would need the offline PDF/OCR dependencies that
+# requirements.txt deliberately excludes. Together these are ~8 MB:
+#   data/processed/chunks.jsonl   the chunk store
+#   data/processed/evaluation.json the retrieval benchmark report
+#   data/indexes/faiss/           FAISS index + metadata
+#   data/indexes/bm25/            BM25 index
+# Re-run `python scripts/ingest.py` locally and commit the result whenever the
+# source PDFs or the chunking configuration change.
+#
+# Page images are NOT committed: 219 PNGs totalling ~156 MB, and nothing serves
+# or reads them (there is no static mount, and the frontend ignores visual_ref).
+# The wildcard form is required - git will not descend into an excluded
+# directory, so `data/processed/` plus a negation would not work.
+data/processed/*
+!data/processed/chunks.jsonl
+!data/processed/evaluation.json
 
 # --- Frontend ---
 frontend/node_modules/

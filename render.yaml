@@ -11,27 +11,46 @@
 #   2. Unbounded concurrency. Every in-flight request holds transformer
 #      activations, so the limits below cap how many can exist at once.
 #
-# If the dashboard-configured start command differs from the one below, update it
-# there too - the dashboard value wins for a service that was not created from
-# this blueprint.
+# IMPORTANT: for a service that was NOT created from this blueprint, Render uses
+# the Build Command and Start Command stored in the dashboard and ignores the
+# values below. Editing this file alone will not change that service. Copy both
+# commands into Settings -> Build & Deploy by hand.
+#
+# In particular, a Build Command of
+#     pip install -r requirements.txt && python scripts/ingest.py
+# fails: requirements.txt is serving-only, so ingestion cannot import pdfplumber.
+# It must be just
+#     pip install -r requirements.txt
 
 services:
   - type: web
     name: hybrid-rag
     runtime: python
     plan: starter
+    # Serving dependencies ONLY. requirements.txt deliberately omits pdfplumber,
+    # PyMuPDF, pandas and scikit-learn, so the build must NOT run
+    # scripts/ingest.py - ingestion needs those packages and would fail here with
+    # ModuleNotFoundError. It does not need to run anyway: the FAISS and BM25
+    # indexes are committed to the repo and read directly at startup. Rebuild
+    # them locally with `pip install -r requirements-offline.txt` followed by
+    # `python scripts/ingest.py`, then commit the updated data/ artifacts.
     buildCommand: pip install --no-cache-dir -r requirements.txt
     # --workers 1        one copy of the ~200 MB of model weights, never two
     # --limit-concurrency rejects excess load with 503 instead of running out of
     #                     memory, so a traffic spike degrades instead of dying
     # --timeout-keep-alive  drop idle connections rather than holding buffers
+    #
+    # Deliberately NOT used: --limit-max-requests. With a single worker there is
+    # no sibling process to take over, so uvicorn terminating the process to
+    # recycle it is a hard restart with downtime - indistinguishable in the logs
+    # from the OOM restarts this configuration exists to prevent. Resident memory
+    # is flat across requests, so there is nothing to recycle for.
     startCommand: >-
       uvicorn backend.main:app
       --host 0.0.0.0
       --port $PORT
       --workers 1
       --limit-concurrency 12
-      --limit-max-requests 2000
       --timeout-keep-alive 5
     healthCheckPath: /health
     envVars:

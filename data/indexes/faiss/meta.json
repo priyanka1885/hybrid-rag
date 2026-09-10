@@ -1,0 +1,5 @@
+{
+  "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
+  "dimension": 384,
+  "num_vectors": 2568
+}
