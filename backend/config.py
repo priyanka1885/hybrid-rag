@@ -163,7 +163,7 @@ class Settings:
     RRF_K: int = _get_int("RRF_K", 60)
     # Upper bound on the candidate union handed to the cross-encoder. The pool
     # is the FULL dense+BM25 union; this only caps pathologically large unions.
-    RETRIEVAL_POOL_SIZE: int = _get_int("RETRIEVAL_POOL_SIZE", 120)
+    RETRIEVAL_POOL_SIZE: int = _get_int("RETRIEVAL_POOL_SIZE", 40)
     # Rank-aware safety net: after cross-encoder reranking, always include the
     # top-N chunks by hybrid (RRF) rank in the evidence sent to the LLM, even if
     # the cross-encoder demoted them. This prevents the observed failure where a
