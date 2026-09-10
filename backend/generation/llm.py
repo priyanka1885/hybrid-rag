@@ -21,11 +21,48 @@ crashing.
 from __future__ import annotations
 
 import json
+import threading
+import time
 from dataclasses import dataclass
 
 import requests
 
 from backend.config import settings
+
+# One pooled HTTP session for the whole process. requests.get/post at module
+# level build a fresh connection pool, TLS context and adapter per call; reusing
+# one session keeps that allocation out of the per-request path (and /health is
+# polled continuously by the platform health check).
+_HTTP_LOCK = threading.Lock()
+_http_session: requests.Session | None = None
+
+
+def _session() -> requests.Session:
+    global _http_session
+    with _HTTP_LOCK:
+        if _http_session is None:
+            sess = requests.Session()
+            # Small pool: this process only ever talks to one host, and each
+            # pooled connection holds its own buffers.
+            adapter = requests.adapters.HTTPAdapter(
+                pool_connections=1, pool_maxsize=4, max_retries=0
+            )
+            sess.mount("https://", adapter)
+            sess.mount("http://", adapter)
+            _http_session = sess
+        return _http_session
+
+
+# Health results are cached for this many seconds. The platform health check and
+# the frontend both poll /health, and the previous implementation fetched and
+# JSON-parsed OpenRouter's entire model catalogue on every single call. That
+# repeatedly allocated and freed a large object graph, which fragments the heap
+# and drives resident memory up over time on a small instance.
+_HEALTH_TTL_SECONDS = 300.0
+# Keyed by model name: two clients configured for different models must not read
+# each other's status out of the cache.
+_health_cache: dict[str, tuple[float, dict]] = {}
+_HEALTH_CACHE_LOCK = threading.Lock()
 
 
 class LLMUnavailableError(RuntimeError):
@@ -242,15 +279,21 @@ class OllamaClient:
             headers["Authorization"] = f"Bearer {self.api_key}"
         return headers
 
-    def health(self) -> dict:
+    def health(self, use_cache: bool = True) -> dict:
         """Return a dict describing LLM (OpenRouter) availability.
 
         Does NOT depend on any local Ollama endpoint. Availability is gated on
         the API key being configured; when a key is present we additionally do a
         light-weight, short-timeout call to the models endpoint to confirm the
-        API is reachable and that the configured model is offered. The returned
-        shape (reachable / model_available / model / available_models) is kept
-        identical to the previous implementation so callers are unaffected.
+        API is reachable and that the configured model is offered.
+
+        The result is cached for :data:`_HEALTH_TTL_SECONDS`. ``/health`` is
+        polled continuously by the hosting platform, and the model catalogue this
+        checks against is a large JSON document that changes rarely - parsing it
+        on every poll was pure allocation churn. ``available_models`` is no
+        longer returned in full for the same reason (no caller used it);
+        ``num_available_models`` reports the count instead, and the key is kept
+        as an empty list so the response shape stays backwards compatible.
         """
         if not self.api_key:
             return {
@@ -258,24 +301,49 @@ class OllamaClient:
                 "model_available": False,
                 "model": self.model,
                 "available_models": [],
+                "num_available_models": 0,
                 "note": "OPENROUTER_API_KEY is not set.",
             }
+
+        if use_cache:
+            cached = _health_cache.get(self.model)
+            if cached is not None and (time.monotonic() - cached[0]) < _HEALTH_TTL_SECONDS:
+                return dict(cached[1])
+
+        result = self._probe_models()
+        with _HEALTH_CACHE_LOCK:
+            _health_cache[self.model] = (time.monotonic(), result)
+        return dict(result)
+
+    def _probe_models(self) -> dict:
+        """One live call to the models endpoint. Never raises."""
         try:
-            resp = requests.get(self._models_url, headers=self._headers(), timeout=5)
+            resp = _session().get(self._models_url, headers=self._headers(), timeout=5)
             resp.raise_for_status()
             data = resp.json().get("data", [])
-            names = {m.get("id", "") for m in data if isinstance(m, dict)}
-            # Match on the exact id, or ignoring an optional ":free"/":<variant>"
-            # suffix, so a configured "...:free" model still resolves.
-            model_present = (not names) or any(
-                n == self.model or n.split(":")[0] == self.model.split(":")[0]
-                for n in names
-            )
+            # Only the ids are needed. Extract them, then drop the decoded
+            # catalogue immediately instead of holding the whole object graph.
+            wanted = self.model.split(":")[0]
+            count = 0
+            model_present = False
+            for m in data:
+                if not isinstance(m, dict):
+                    continue
+                name = m.get("id", "")
+                if not name:
+                    continue
+                count += 1
+                if name == self.model or name.split(":")[0] == wanted:
+                    model_present = True
+            del data, resp
             return {
                 "reachable": True,
-                "model_available": model_present,
+                # An empty catalogue means the endpoint told us nothing useful,
+                # so do not treat that as "model missing" (unchanged behaviour).
+                "model_available": model_present or count == 0,
                 "model": self.model,
-                "available_models": sorted(n for n in names if n),
+                "available_models": [],
+                "num_available_models": count,
             }
         except Exception:
             # Key is present but the API could not be reached right now. Report
@@ -285,6 +353,7 @@ class OllamaClient:
                 "model_available": False,
                 "model": self.model,
                 "available_models": [],
+                "num_available_models": 0,
             }
 
     def warmup(self) -> bool:
@@ -314,7 +383,7 @@ class OllamaClient:
             "stream": False,
         }
         try:
-            resp = requests.post(
+            resp = _session().post(
                 self._chat_url,
                 json=payload,
                 headers=self._headers(),

@@ -92,6 +92,11 @@ class HealthResponse(BaseModel):
     status: str
     llm: dict
     indexes_loaded: bool
+    # Resident memory of the serving process in MB. Exposed so an out-of-memory
+    # restart can be diagnosed from the outside (watch it across requests to
+    # tell a real leak from normal steady-state usage). None where the platform
+    # does not expose it.
+    memory_mb: Optional[float] = None
 
 
 class MethodMetrics(BaseModel):

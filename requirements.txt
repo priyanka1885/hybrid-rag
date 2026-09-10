@@ -1,3 +1,25 @@
+# ---------------------------------------------------------------------------
+# SERVING dependencies - everything the API needs to answer a question, and
+# nothing else.
+#
+# This list is deliberately minimal because the service is memory-bound, not
+# CPU-bound. The two fp32 ONNX sessions already account for ~200 MB of resident
+# memory, so on a 512 MB instance an unnecessary import is the difference
+# between running and being OOM-killed. Measured import cost of the packages
+# that used to be here but are not needed to serve:
+#
+#     scikit-learn   ~46 MB   (not imported anywhere in the codebase)
+#     pandas         ~44 MB   (offline benchmark only)
+#     PyMuPDF        ~23 MB   (PDF ingestion only)
+#     pdfplumber      ~4 MB   (PDF ingestion only)
+#
+# Ingestion, evaluation and tests run offline on a developer machine, so their
+# dependencies live in requirements-offline.txt. Install that locally:
+#
+#     pip install -r requirements-offline.txt
+#
+# ---------------------------------------------------------------------------
+
 # --- Core RAG pipeline ---
 faiss-cpu>=1.8.0
 rank-bm25>=0.2.2
@@ -9,20 +31,6 @@ onnxruntime>=1.20.0
 tokenizers>=0.20.0
 huggingface-hub>=0.26.0
 numpy>=1.26.0
-scikit-learn>=1.4.0
-
-# --- PDF ingestion ---
-pdfplumber>=0.11.0
-
-# --- Multimodal ingestion (OPT-IN via ENABLE_VISUAL_INGEST) ---
-# PyMuPDF renders page images and detects embedded figures/images; pytesseract
-# drives OCR for scanned pages / image-based tables / text inside figures.
-# OCR additionally requires the Tesseract engine binary to be installed.
-PyMuPDF>=1.24.0
-pytesseract>=0.3.10
-
-# --- Data / evaluation ---
-pandas>=2.2.0
 
 # --- API ---
 fastapi>=0.110.0
@@ -30,7 +38,3 @@ uvicorn[standard]>=0.29.0
 pydantic>=2.6.0
 requests>=2.31.0
 python-dotenv>=1.0.0
-
-# --- Testing ---
-pytest>=8.0.0
-httpx>=0.27.0

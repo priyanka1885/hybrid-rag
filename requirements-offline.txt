@@ -1,0 +1,32 @@
+# ---------------------------------------------------------------------------
+# OFFLINE dependencies - PDF ingestion, the retrieval benchmark, and tests.
+#
+# These are NOT installed on the serving instance. They are only needed to run
+# `scripts/ingest.py`, `scripts/evaluate.py` and the test suite, all of which
+# execute on a developer machine and write their output (chunks.jsonl, the FAISS
+# and BM25 indexes, evaluation.json) into data/ for the API to read.
+#
+# Keeping them out of requirements.txt keeps ~117 MB of imports out of the
+# serving process; see the note at the top of requirements.txt.
+#
+#     pip install -r requirements-offline.txt
+# ---------------------------------------------------------------------------
+
+-r requirements.txt
+
+# --- PDF ingestion ---
+pdfplumber>=0.11.0
+
+# --- Multimodal ingestion (OPT-IN via ENABLE_VISUAL_INGEST) ---
+# PyMuPDF renders page images and detects embedded figures/images; pytesseract
+# drives OCR for scanned pages / image-based tables / text inside figures.
+# OCR additionally requires the Tesseract engine binary to be installed.
+PyMuPDF>=1.24.0
+pytesseract>=0.3.10
+
+# --- Data / evaluation ---
+pandas>=2.2.0
+
+# --- Testing ---
+pytest>=8.0.0
+httpx>=0.27.0

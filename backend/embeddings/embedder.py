@@ -23,7 +23,9 @@ from functools import lru_cache
 
 import numpy as np
 
+from backend.batching import plan_length_batches
 from backend.config import settings
+from backend.runtime import MODEL_LOAD_LOCK, MODEL_LOCK, release_memory
 
 # Files fetched from the model repo. The ONNX graph is the official fp32 export
 # (NOT a quantized variant - quantization would shift the vectors and invalidate
@@ -37,37 +39,75 @@ _POOLING_CONFIG_FILE = "1_Pooling/config.json"
 _DEFAULT_MAX_SEQ_LENGTH = 256
 _DEFAULT_DIMENSION = 384
 
+# Upper bound on texts per batch. ``settings.EMBED_TOKEN_BUDGET`` usually binds
+# first; this only stops a very large batch of very short texts.
+_DEFAULT_BATCH_SIZE = 32
+# Texts are tokenized this many at a time. Ingestion embeds the whole corpus in
+# a single encode() call, and tokenizing every chunk up front would hold
+# thousands of Encoding objects (ids, masks, offsets) in memory at once purely to
+# plan batches. Windowing bounds that without affecting the output.
+_TOKENIZE_WINDOW = 256
+
 
 class _OnnxTextEncoder:
     """An ONNX Runtime session + tokenizer that mean-pools token embeddings."""
 
-    def __init__(self, session, tokenizer, max_seq_length: int, dimension: int):
+    def __init__(self, session, tokenizer, max_seq_length: int, dimension: int,
+                 pad_id: int = 0):
         self.session = session
         self.tokenizer = tokenizer
         self.max_seq_length = max_seq_length
         self.dimension = dimension
+        self.pad_id = pad_id
         # Only feed the inputs this particular graph declares (some exports omit
         # token_type_ids).
         self._input_names = [i.name for i in session.get_inputs()]
 
-    def encode_batch(self, texts: list[str]) -> np.ndarray:
-        """Embed one batch: tokenize -> run -> mean-pool -> L2 normalize."""
+    def tokenize(self, texts: list[str]) -> tuple[list, list[int]]:
+        """Tokenize without padding, returning the encodings and token lengths.
+
+        Padding is applied per batch in :meth:`run_batch` instead of by the
+        tokenizer, so batches can be planned from real token lengths and each is
+        padded only to its own longest member.
+        """
         encodings = self.tokenizer.encode_batch(texts)
-        input_ids = np.asarray([e.ids for e in encodings], dtype=np.int64)
-        attention_mask = np.asarray([e.attention_mask for e in encodings], dtype=np.int64)
+        return encodings, [len(e.ids) for e in encodings]
+
+    def run_batch(self, encodings, lengths: list[int], idxs: list[int]) -> np.ndarray:
+        """Embed one planned batch: pad -> run -> mean-pool -> L2 normalize."""
+        seq = max(lengths[i] for i in idxs)
+        rows = len(idxs)
+
+        input_ids = np.full((rows, seq), self.pad_id, dtype=np.int64)
+        attention_mask = np.zeros((rows, seq), dtype=np.int64)
+        types = (
+            np.zeros((rows, seq), dtype=np.int64)
+            if "token_type_ids" in self._input_names
+            else None
+        )
+        for row, i in enumerate(idxs):
+            enc = encodings[i]
+            n = lengths[i]
+            input_ids[row, :n] = enc.ids
+            attention_mask[row, :n] = enc.attention_mask
+            if types is not None:
+                types[row, :n] = enc.type_ids
 
         feed = {}
         if "input_ids" in self._input_names:
             feed["input_ids"] = input_ids
         if "attention_mask" in self._input_names:
             feed["attention_mask"] = attention_mask
-        if "token_type_ids" in self._input_names:
-            feed["token_type_ids"] = np.asarray(
-                [e.type_ids for e in encodings], dtype=np.int64
-            )
+        if types is not None:
+            feed["token_type_ids"] = types
 
-        # (batch, seq_len, hidden) token embeddings.
-        token_embeddings = self.session.run(None, feed)[0]
+        # (batch, seq_len, hidden) token embeddings. Inference is serialized
+        # process-wide: each concurrent Run() would allocate its own set of
+        # transformer activations, so unbounded parallelism here is what turns a
+        # traffic spike into an out-of-memory restart. The session is pinned to
+        # one thread anyway, so serializing costs no real throughput.
+        with MODEL_LOCK:
+            token_embeddings = self.session.run(None, feed)[0]
 
         # Attention-mask-weighted mean pooling: padding tokens must not
         # contribute, otherwise a padded batch yields different vectors than the
@@ -77,13 +117,21 @@ class _OnnxTextEncoder:
         counts = np.clip(mask.sum(axis=1), 1e-9, None)
         pooled = summed / counts
 
+        # Drop the (batch, seq_len, hidden) activation block as soon as it has
+        # been pooled down to (batch, hidden); it is by far the largest array
+        # allocated per call and holding it until the frame exits doubles peak.
+        del token_embeddings, feed, summed, mask, input_ids, attention_mask, types
+
         # L2 normalize so inner product == cosine similarity.
         norms = np.linalg.norm(pooled, axis=1, keepdims=True)
         pooled = pooled / np.clip(norms, 1e-12, None)
         return np.asarray(pooled, dtype="float32")
 
 
-@lru_cache(maxsize=2)
+# maxsize=1: the fp32 session costs ~108 MB resident, so caching a second one
+# for a different model name would silently double the largest single allocation
+# in the process. Only one embedding model can match the FAISS index anyway.
+@lru_cache(maxsize=1)
 def _load_model(model_name: str) -> _OnnxTextEncoder:
     """Download and open the ONNX session + tokenizer for ``model_name``.
 
@@ -122,26 +170,45 @@ def _load_model(model_name: str) -> _OnnxTextEncoder:
         pass
 
     # Low-memory CPU settings: a single thread and no arena/pattern caching keep
-    # resident memory low on small instances.
+    # resident memory low on small instances. Spinning is disabled too - an
+    # idle spinning thread holds its scratch buffers resident between requests.
     opts = ort.SessionOptions()
     opts.intra_op_num_threads = 1
     opts.inter_op_num_threads = 1
     opts.enable_cpu_mem_arena = False
     opts.enable_mem_pattern = False
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    for key, value in (
+        ("session.intra_op.allow_spinning", "0"),
+        ("session.inter_op.allow_spinning", "0"),
+    ):
+        try:
+            opts.add_session_config_entry(key, value)
+        except Exception:  # pragma: no cover - older onnxruntime builds
+            pass
 
     session = ort.InferenceSession(
         onnx_path, sess_options=opts, providers=["CPUExecutionProvider"]
     )
+    # Graph optimization builds a fused copy of the graph alongside the original
+    # initializers. Trim once the session is live so those transient pages go
+    # back to the OS instead of padding the process baseline forever.
+    release_memory()
 
     tokenizer = Tokenizer.from_file(tokenizer_path)
     tokenizer.enable_truncation(max_length=max_seq_length)
+    # Padding is applied per batch (see _OnnxTextEncoder.run_batch), not by the
+    # tokenizer, so batches can be sized against a real token-count budget.
     pad_id = tokenizer.token_to_id("[PAD]")
-    tokenizer.enable_padding(
-        pad_id=pad_id if pad_id is not None else 0, pad_token="[PAD]"
-    )
+    tokenizer.no_padding()
 
-    return _OnnxTextEncoder(session, tokenizer, max_seq_length, dimension)
+    return _OnnxTextEncoder(
+        session,
+        tokenizer,
+        max_seq_length,
+        dimension,
+        pad_id=pad_id if pad_id is not None else 0,
+    )
 
 
 class Embedder:
@@ -153,29 +220,65 @@ class Embedder:
 
     @property
     def model(self):
+        # Double-checked locking: lru_cache memoizes the session but does not
+        # prevent two threads from building one simultaneously, and each session
+        # is ~108 MB. See backend.runtime.MODEL_LOAD_LOCK.
         if self._model is None:
-            self._model = _load_model(self.model_name)
+            with MODEL_LOAD_LOCK:
+                self._model = _load_model(self.model_name)
         return self._model
 
     @property
     def dimension(self) -> int:
         return int(self.model.dimension)
 
-    def encode(self, texts: list[str], batch_size: int = 32, show_progress: bool = False) -> np.ndarray:
-        """Return an (n, dim) float32 array of L2-normalized embeddings."""
+    def encode(
+        self,
+        texts: list[str],
+        batch_size: int = _DEFAULT_BATCH_SIZE,
+        show_progress: bool = False,
+        token_budget: int | None = None,
+    ) -> np.ndarray:
+        """Return an (n, dim) float32 array of L2-normalized embeddings.
+
+        Memory is bounded in three ways, which matters because ingestion embeds
+        the whole corpus in one call while the API embeds one question:
+
+        * texts are tokenized a window at a time, so the tokenizer's output for
+          thousands of chunks never exists all at once;
+        * within a window, batches are planned against a ``batch * seq**2``
+          budget, so peak attention memory is bounded regardless of chunk length;
+        * results are scattered into one preallocated array instead of being
+          collected and ``vstack``-ed, which would hold two full copies.
+
+        Row order matches ``texts``, and vectors are unchanged by batching
+        because mean pooling is attention-mask weighted.
+        """
         if not texts:
             return np.zeros((0, self.dimension), dtype="float32")
+
         model = self.model
+        budget = token_budget or settings.EMBED_TOKEN_BUDGET
         total = len(texts)
-        out: list[np.ndarray] = []
-        for start in range(0, total, batch_size):
-            out.append(model.encode_batch(list(texts[start : start + batch_size])))
+        out = np.zeros((total, self.dimension), dtype="float32")
+        done = 0
+
+        for window_start in range(0, total, _TOKENIZE_WINDOW):
+            window = list(texts[window_start : window_start + _TOKENIZE_WINDOW])
+            encodings, lengths = model.tokenize(window)
+            for idxs in plan_length_batches(lengths, batch_size, budget):
+                vectors = model.run_batch(encodings, lengths, idxs)
+                for row, i in enumerate(idxs):
+                    out[window_start + i] = vectors[row]
+                del vectors
+            del encodings, lengths
+            done += len(window)
             if show_progress:
-                done = min(start + batch_size, total)
                 print(f"  embedding {done}/{total}", end="\r", file=sys.stderr, flush=True)
+
         if show_progress:
             print(file=sys.stderr)
-        return np.vstack(out).astype("float32", copy=False)
+        return out
 
     def encode_one(self, text: str) -> np.ndarray:
         return self.encode([text])[0]

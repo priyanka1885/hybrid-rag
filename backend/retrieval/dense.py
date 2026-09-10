@@ -18,6 +18,13 @@ import numpy as np
 from backend.config import FAISS_INDEX_PATH, FAISS_META_PATH, settings
 from backend.embeddings.embedder import Embedder
 from backend.retrieval.store import ChunkStore
+from backend.runtime import configure_faiss_threads
+
+# faiss defaults to one OpenMP thread per CPU, each with its own scratch space.
+# The corpus here is a few thousand vectors, so extra threads buy nothing and
+# only add resident memory. Applied here rather than at process start because the
+# setting only exists once faiss itself has been imported.
+configure_faiss_threads()
 
 
 class DenseRetriever:
@@ -114,7 +121,9 @@ class DenseRetriever:
 
 def build_faiss_index(store: ChunkStore, embedder: Embedder, show_progress: bool = True):
     """Embed all chunks and build a normalized inner-product FAISS index."""
-    vectors = embedder.encode(store.texts, show_progress=show_progress)
+    # Ingestion is a one-off offline job with the whole machine to itself, so a
+    # larger batch than the serving default is worth the extra transient memory.
+    vectors = embedder.encode(store.texts, batch_size=32, show_progress=show_progress)
     dim = vectors.shape[1]
     index = faiss.IndexFlatIP(dim)
     index.add(vectors)

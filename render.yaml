@@ -1,0 +1,68 @@
+# Render blueprint for the Hybrid RAG API.
+#
+# The critical settings here are all about memory. The process baseline is
+# roughly 310 MB (two fp32 ONNX sessions ~200 MB, plus Python, FastAPI, faiss,
+# ONNX Runtime and the indexes), so on a 512 MB instance there is only about
+# 200 MB of headroom and the two things that reliably exhaust it are:
+#
+#   1. More than one worker. Each uvicorn worker is a full copy of the model
+#      sessions, so `--workers 2` alone doubles the baseline to ~620 MB and the
+#      instance is killed immediately. This MUST stay at 1.
+#   2. Unbounded concurrency. Every in-flight request holds transformer
+#      activations, so the limits below cap how many can exist at once.
+#
+# If the dashboard-configured start command differs from the one below, update it
+# there too - the dashboard value wins for a service that was not created from
+# this blueprint.
+
+services:
+  - type: web
+    name: hybrid-rag
+    runtime: python
+    plan: starter
+    buildCommand: pip install --no-cache-dir -r requirements.txt
+    # --workers 1        one copy of the ~200 MB of model weights, never two
+    # --limit-concurrency rejects excess load with 503 instead of running out of
+    #                     memory, so a traffic spike degrades instead of dying
+    # --timeout-keep-alive  drop idle connections rather than holding buffers
+    startCommand: >-
+      uvicorn backend.main:app
+      --host 0.0.0.0
+      --port $PORT
+      --workers 1
+      --limit-concurrency 12
+      --limit-max-requests 2000
+      --timeout-keep-alive 5
+    healthCheckPath: /health
+    envVars:
+      # glibc allocates a separate arena per thread and never returns them, so
+      # RSS otherwise grows with thread count instead of with real usage. This
+      # must be an environment variable to take effect at process start;
+      # backend.runtime also applies it via mallopt as a belt-and-braces measure.
+      - key: MALLOC_ARENA_MAX
+        value: "2"
+      # Pin the native math libraries to one thread each. Extra threads buy no
+      # speed on a fractional-CPU instance and each one costs scratch memory.
+      - key: OMP_NUM_THREADS
+        value: "1"
+      - key: OPENBLAS_NUM_THREADS
+        value: "1"
+      - key: MKL_NUM_THREADS
+        value: "1"
+      - key: TOKENIZERS_PARALLELISM
+        value: "false"
+      # Cap the thread pool that runs the sync endpoints. Starlette's default is
+      # 40, which would allow 40 concurrent inferences and their activations.
+      - key: MAX_REQUEST_THREADS
+        value: "2"
+      # Keep the Hugging Face cache on the instance disk rather than re-fetching
+      # the ~86 MB ONNX graphs into a temp dir on every cold start.
+      - key: HF_HOME
+        value: /opt/render/project/.cache/huggingface
+      # Never write .pyc files for modules imported once at startup.
+      - key: PYTHONDONTWRITEBYTECODE
+        value: "1"
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: OPENROUTER_API_KEY
+        sync: false

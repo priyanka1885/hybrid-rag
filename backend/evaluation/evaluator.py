@@ -16,21 +16,25 @@ metrics for each method:
 
 Metrics: Recall@K, Precision@K, MRR, Hit Rate. The purpose is to show whether
 the hybrid architecture actually improves retrieval - no numbers are hardcoded.
+
+MEMORY NOTE
+-----------
+Nothing in this module is imported eagerly by the API. ``pandas`` costs roughly
+44 MB of resident memory just to import and is only needed by the offline
+benchmark, so it is imported inside the functions that use it rather than at
+module scope. ``dataset_stats`` - the only function the ``/evaluation`` endpoint
+calls - deliberately avoids pandas entirely and streams the QA CSV with the
+standard library, so serving a request never pulls the dependency in. The
+retriever/reranker imports are function-local for the same reason.
 """
 from __future__ import annotations
 
+import csv
 import json
 import random
 import re
 
-import pandas as pd
-
 from backend.config import EVAL_RESULTS_PATH, QA_CSV_PATH, settings
-from backend.reranking.reranker import Reranker
-from backend.retrieval.bm25 import BM25Retriever
-from backend.retrieval.dense import DenseRetriever
-from backend.retrieval.hybrid import HybridRetriever
-from backend.retrieval.store import ChunkStore
 
 _WORD_RE = re.compile(r"[a-z0-9]+(?:\.[0-9]+)?")
 _STOP = {"the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with",
@@ -71,9 +75,31 @@ def _metrics_for_ranking(hit_flags: list[bool], k: int) -> dict:
     }
 
 
+def _require_pandas():
+    """Import pandas on demand, with an actionable message if it is absent.
+
+    pandas is an offline-only dependency (see the MEMORY NOTE above) and is not
+    installed on the serving instance, so the failure needs to point at the right
+    requirements file rather than surfacing a bare ImportError.
+    """
+    try:
+        import pandas as pd
+    except ImportError as exc:  # pragma: no cover - depends on the environment
+        raise ImportError(
+            "pandas is required for the offline retrieval benchmark but is not "
+            "installed. It is intentionally excluded from the serving "
+            "dependencies to keep the API's memory footprint small. Install the "
+            "offline set with: pip install -r requirements-offline.txt"
+        ) from exc
+    return pd
+
+
 def load_qa(sample_size: int | None = None, seed: int = 42) -> list[dict]:
+    """Load the benchmark QA pairs. Offline use only (imports pandas)."""
     if not QA_CSV_PATH.exists():
         raise FileNotFoundError(f"QA dataset not found at {QA_CSV_PATH}.")
+    pd = _require_pandas()
+
     df = pd.read_csv(QA_CSV_PATH)
     df = df.dropna(subset=["Question", "Context"])
     rows = [{"question": str(r["Question"]), "context": str(r["Context"])} for _, r in df.iterrows()]
@@ -85,6 +111,12 @@ def load_qa(sample_size: int | None = None, seed: int = 42) -> list[dict]:
 
 def evaluate(sample_size: int | None = 150, k: int = None, verbose: bool = True) -> dict:
     """Run the retrieval benchmark and return a results dict."""
+    from backend.reranking.reranker import Reranker
+    from backend.retrieval.bm25 import BM25Retriever
+    from backend.retrieval.dense import DenseRetriever
+    from backend.retrieval.hybrid import HybridRetriever
+    from backend.retrieval.store import ChunkStore
+
     k = k or settings.RERANK_TOP_K
     store = ChunkStore.load()
     dense = DenseRetriever(store).load()
@@ -176,19 +208,44 @@ def load_results() -> dict | None:
     return None
 
 
-def dataset_stats() -> dict:
-    """Return real dataset statistics for the Evaluation page."""
-    store = ChunkStore.load()
+def count_eval_questions() -> int:
+    """Number of distinct questions in the QA CSV, counted without pandas.
+
+    ``pd.read_csv`` on this file materializes every long Context/Value string as
+    a DataFrame - tens of MB of transient memory - just to produce one integer,
+    and the ``/evaluation`` endpoint used to pay that cost on every request. The
+    standard library reader streams row by row, so peak memory is one row plus
+    the set of question strings.
+    """
+    if not QA_CSV_PATH.exists():
+        return 0
+    try:
+        seen: set[str] = set()
+        with open(QA_CSV_PATH, "r", encoding="utf-8", newline="") as fh:
+            for row in csv.DictReader(fh):
+                question = (row.get("Question") or "").strip()
+                if question:
+                    seen.add(question)
+        return len(seen)
+    except Exception:
+        return 0
+
+
+def dataset_stats(store=None) -> dict:
+    """Return real dataset statistics for the Evaluation page.
+
+    ``store`` accepts the already-loaded :class:`~backend.retrieval.store.ChunkStore`
+    so the endpoint can reuse the engine's copy. Previously this loaded a second,
+    independent copy of every chunk on each request, which meant a page refresh
+    allocated the whole corpus again on top of an already tight heap.
+    """
+    if store is None:
+        from backend.retrieval.store import ChunkStore
+
+        store = ChunkStore.load()
     num_docs = len({c["document_file"] for c in store.chunks})
-    num_questions = 0
-    if QA_CSV_PATH.exists():
-        try:
-            df = pd.read_csv(QA_CSV_PATH).dropna(subset=["Question"])
-            num_questions = int(df["Question"].nunique())
-        except Exception:
-            num_questions = 0
     return {
         "num_documents": num_docs,
         "num_chunks": len(store),
-        "num_eval_questions": num_questions,
+        "num_eval_questions": count_eval_questions(),
     }

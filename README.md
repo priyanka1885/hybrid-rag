@@ -111,8 +111,20 @@ python -m venv .venv
 # macOS / Linux:
 source .venv/bin/activate
 
-pip install -r requirements.txt
+# local development: serving + ingestion + evaluation + tests
+pip install -r requirements-offline.txt
 ```
+
+Dependencies are split in two, because the deployed service is memory-bound:
+
+| File | Contents | Used by |
+| --- | --- | --- |
+| `requirements.txt` | only what the API needs to answer a question | the deployed service |
+| `requirements-offline.txt` | the above plus `pdfplumber`, `PyMuPDF`, `pandas`, `pytest` | ingestion, evaluation, tests |
+
+Ingestion and evaluation run locally and write their output into `data/`, so the
+server never needs their dependencies. Keeping them out saves roughly 117 MB of
+resident memory on the instance — see [Deployment](#deployment-memory).
 
 ### 2. Frontend
 
@@ -202,11 +214,65 @@ below.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET`  | `/health` | `{ "status": "ok", "llm": {...}, "indexes_loaded": true }` |
+| `GET`  | `/health` | `{ "status": "ok", "llm": {...}, "indexes_loaded": true, "memory_mb": 331.4 }` |
 | `POST` | `/ask` | Body `{ "question": "..." }` → answer, citations, verification, retrieval_details |
 | `GET`  | `/evaluation` | Real dataset stats + Dense/BM25/Hybrid/Hybrid+Reranker metrics |
 
 Interactive docs: `http://localhost:8000/docs`.
+
+`memory_mb` is the serving process's resident memory. Watch it across requests to
+tell normal steady-state usage from a genuine leak: it should settle and stay
+flat, not climb.
+
+---
+
+<a id="deployment-memory"></a>
+## Deployment and memory
+
+The service is memory-bound, not CPU-bound. Two fp32 ONNX sessions dominate the
+footprint, and on a 512 MB instance there is not much left over:
+
+| Component | Resident |
+| --- | --- |
+| Python + FastAPI + Uvicorn + Pydantic | ~46 MB |
+| NumPy + faiss + ONNX Runtime | ~36 MB |
+| Chunk store + FAISS index + BM25 index | ~24 MB |
+| Embedder ONNX session (fp32, 86 MB graph) | ~108 MB |
+| Cross-encoder ONNX session (fp32, 87 MB graph) | ~95 MB |
+| **Steady-state baseline** | **~310 MB** |
+
+`render.yaml` captures the settings that keep it inside the limit. If the service
+was created from the dashboard rather than from this blueprint, apply the same
+values there — the dashboard's own start command wins.
+
+**The one that matters most: `--workers 1`.** Each uvicorn worker is a complete
+copy of the model sessions, so `--workers 2` doubles the baseline to ~620 MB and
+the instance is killed on startup, every time.
+
+The rest bound how much a *concurrent* burst can add on top of the baseline:
+
+- `--limit-concurrency` sheds excess load with a 503 instead of running out of
+  memory, so a traffic spike degrades rather than restarting the service.
+- `MAX_REQUEST_THREADS` caps the thread pool that runs the sync endpoints
+  (Starlette defaults to 40). Each in-flight request holds its own candidate pool
+  and response tree, so this is a direct multiplier on peak memory.
+- `RERANK_TOKEN_BUDGET` / `EMBED_TOKEN_BUDGET` bound transformer inference on
+  `batch × seq²` rather than on batch size. Attention memory grows with the
+  *square* of sequence length, so a fixed batch of 16 padded to the full
+  512-token window allocates ~192 MB for one tensor, while the same budget keeps
+  it near 12 MB by batching short table rows widely and long passages narrowly.
+  Scores are unaffected — padding is excluded by the attention mask.
+- `MALLOC_ARENA_MAX=2` stops glibc from parking freed memory in a separate arena
+  per thread, which is what makes resident memory climb request after request and
+  look like a leak.
+
+Measured effect of the above on a 512 MB instance: baseline ~310 MB, and peak
+under 12-way concurrent load ~370 MB instead of ~520 MB.
+
+If you need more headroom than that, the honest options are to move to a larger
+instance or to switch the two ONNX graphs to fp16/int8 exports. The latter halves
+the ~200 MB of weights but shifts the vectors and the cross-encoder logits, so it
+requires rebuilding the FAISS index and re-checking `MIN_RERANK_SCORE`.
 
 ---
 
@@ -234,6 +300,8 @@ hybrid-rag-financial-reports/
 │   ├── main.py                 # FastAPI app (/health, /ask, /evaluation)
 │   ├── config.py               # env-driven configuration (single source of truth)
 │   ├── rag_engine.py           # orchestrates the full pipeline
+│   ├── runtime.py              # process memory hygiene (allocator, thread caps)
+│   ├── batching.py             # memory-bounded batch planning for inference
 │   ├── api/schemas.py          # Pydantic request/response models
 │   ├── ingestion/              # pdf_loader.py, chunker.py, pipeline.py
 │   ├── embeddings/embedder.py  # local embedding model wrapper
@@ -249,7 +317,9 @@ hybrid-rag-financial-reports/
 ├── tests/                      # pytest suite
 ├── data/                       # generated: processed/ + indexes/ (gitignored)
 ├── .env.example
-├── requirements.txt
+├── render.yaml                 # deploy config (memory limits; see Deployment)
+├── requirements.txt            # serving dependencies only
+├── requirements-offline.txt    # + ingestion, evaluation, tests
 └── README.md
 ```
 

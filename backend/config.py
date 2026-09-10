@@ -97,9 +97,29 @@ class Settings:
 
     # --- Embeddings ---
     EMBEDDING_MODEL: str = _get("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+    # Same batch * seq^2 memory budget as the reranker (see RERANK_TOKEN_BUDGET).
+    # At serving time only one short question is embedded per request so this
+    # barely binds; it matters during ingestion, where thousands of chunks are
+    # embedded and a fixed batch of long chunks would allocate a large attention
+    # block. Embeddings are unaffected by batch composition (mean pooling is
+    # attention-mask weighted), so this is purely a memory/speed dial.
+    EMBED_TOKEN_BUDGET: int = _get_int("EMBED_TOKEN_BUDGET", 262144)
 
     # --- Reranker ---
     RERANKER_MODEL: str = _get("RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+    # Memory budget for cross-encoder inference, which is the largest transient
+    # allocation the service makes. A transformer's peak allocation is dominated
+    # by the attention matrix, sized batch * heads * seq_len^2 * 4 bytes - note
+    # the SQUARE on sequence length. Budgeting batch * seq^2 (rather than batch
+    # alone) keeps that block bounded no matter how long the retrieved chunks
+    # are: short table rows still batch widely, and the occasional long passage
+    # runs in a small batch. 262144 * 12 heads * 4 bytes is roughly 12 MB per
+    # attention tensor. Raise it to trade memory for a little latency; lower it
+    # if the instance is tight. Scores are unaffected either way - padding is
+    # masked out - so answerability thresholds stay calibrated.
+    RERANK_TOKEN_BUDGET: int = _get_int("RERANK_TOKEN_BUDGET", 262144)
+    # Hard cap on pairs per batch; the token budget usually binds first.
+    RERANK_BATCH_SIZE: int = _get_int("RERANK_BATCH_SIZE", 16)
     # Table-aware rerank boost. Cross-encoders (ms-marco) reward fluent narrative
     # prose over terse numeric table rows, so an exact-value row (e.g. "Direct
     # scope 1 58 644") can be demoted below generic header/narrative chunks. For
