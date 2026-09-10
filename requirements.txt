@@ -1,9 +1,14 @@
+# Install the CPU-only PyTorch build (no CUDA/NVIDIA libraries) on Linux.
+# PyPI's default linux torch wheel bundles CUDA; the +cpu wheel from the
+# PyTorch CPU index is far smaller and is all this app needs (inference is CPU).
+--extra-index-url https://download.pytorch.org/whl/cpu
+
 # --- Core RAG pipeline ---
 faiss-cpu>=1.8.0
 rank-bm25>=0.2.2
 sentence-transformers>=2.7.0
 transformers>=4.40.0
-torch>=2.2.0
+torch==2.7.1+cpu
 numpy>=1.26.0
 scikit-learn>=1.4.0
 
