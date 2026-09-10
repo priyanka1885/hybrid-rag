@@ -1,14 +1,13 @@
-# Install the CPU-only PyTorch build (no CUDA/NVIDIA libraries) on Linux.
-# PyPI's default linux torch wheel bundles CUDA; the +cpu wheel from the
-# PyTorch CPU index is far smaller and is all this app needs (inference is CPU).
---extra-index-url https://download.pytorch.org/whl/cpu
-
 # --- Core RAG pipeline ---
 faiss-cpu>=1.8.0
 rank-bm25>=0.2.2
-sentence-transformers>=2.7.0
-transformers>=4.40.0
-torch==2.10.0+cpu
+# Embedding + cross-encoder reranking run on ONNX Runtime (CPU) using the
+# pre-exported fp32 ONNX graphs from the official Hugging Face model repos.
+# This keeps the exact same models/vector space as the PyTorch stack while
+# avoiding the large torch + transformers import footprint at serving time.
+onnxruntime>=1.20.0
+tokenizers>=0.20.0
+huggingface-hub>=0.26.0
 numpy>=1.26.0
 scikit-learn>=1.4.0
 
